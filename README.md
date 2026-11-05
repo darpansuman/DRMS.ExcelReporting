@@ -148,6 +148,7 @@ If the application stops before a file is disposed, the file stays on disk. Call
 `generator.DeleteOldReportFiles()` at start-up or on a timer: it deletes `*.xlsx` (and unfinished
 `*.xlsx.tmp`) files older than `Output:CleanupFilesOlderThan` from every configured output folder.
 Sub-folders and other file types are never touched — still, **use a folder that only holds reports**.
+See [Example 5](#example-5--remove-left-over-files-on-a-timer) for a ready-made background service.
 
 ### How a file is written
 
@@ -159,6 +160,380 @@ Sub-folders and other file types are never touched — still, **use a folder tha
 
 File names given in config or in code are cleaned: characters that are not allowed in file names
 (including `/` and `\`) become `_`, so a name can never point outside the output folder.
+
+## Examples
+
+These examples show how to use the library from your own application code. They are not part of the
+library itself. The MinIO calls use the official [Minio .NET SDK](https://github.com/minio/minio-dotnet)
+(`Minio` NuGet package; checked against versions 6.0.5 and 7.0.0).
+
+### Example 1 – Scheduled alert: generate, upload to MinIO, delete the local file
+
+A scheduler job loads alert rows, adds an alert id per agreement, writes them to Excel, uploads the
+file to MinIO and removes the local copy.
+
+**appsettings.json**
+
+```jsonc
+{
+  "ExcelReporting": {
+    "Defaults": {
+      "Output": {
+        "Directory": "{TempPath}/ExcelReports",
+        "DeleteFileOnDispose": true,        // local file is removed after the upload
+        "DeleteEmptyDirectories": true,
+        "CleanupFilesOlderThan": "1.00:00:00"
+      }
+    },
+    "Reports": {
+      "FastOnboardingAlert": {
+        "FileName": "FastOnboardingAlert_{Timestamp}_{Guid:8}.xlsx",
+        "OutputDirectory": "{TempPath}/ExcelReports/{ReportName}",
+        "Sheets": [
+          {
+            "Name": "Fast Onboarding",
+            "DataSource": "FastOnboarding",
+            "Title": "Fast Onboarding Alerts",
+            "Columns": [
+              { "Header": "Alert Id",     "Property": "AlertId",     "DataType": "Integer" },
+              { "Header": "Alert Type",   "Property": "AlertType",   "DataType": "Text" },
+              { "Header": "Agreement Id", "Property": "AgreementId", "DataType": "Text" }
+              // Add one line per FastOnboardingResponse property you want in the file, for example:
+              // { "Header": "Onboarded At", "Property": "OnboardedAt", "DataType": "DateTime" }
+            ]
+          }
+        ]
+      }
+    }
+  },
+
+  // Your own MinIO settings (not read by this library).
+  "MinioStorage": {
+    "Endpoint": "minio.local:9000",
+    "AccessKey": "",
+    "SecretKey": "",
+    "UseSsl": true,
+    "BucketName": "fraud-alerts",
+    "ObjectPrefix": "fast-onboarding"
+  }
+}
+```
+
+> `"Property"` must match a real property name on `FastOnboardingResponse` (upper/lower case is ignored).
+> A wrong name stops the report with a message naming the column, so you find it on the first run.
+> `AlertId` is a string in the DTO; `"DataType": "Integer"` writes it as a number so Excel sorts it correctly.
+
+**Program.cs (registration)**
+
+```csharp
+using Minio;
+
+builder.Services.AddExcelReporting(builder.Configuration);
+
+builder.Services.Configure<MinioStorageOptions>(builder.Configuration.GetSection("MinioStorage"));
+builder.Services.AddMinio(client =>
+{
+    var minio = builder.Configuration.GetSection("MinioStorage").Get<MinioStorageOptions>()!;
+    client.WithEndpoint(minio.Endpoint)
+          .WithCredentials(minio.AccessKey, minio.SecretKey)
+          .WithSSL(minio.UseSsl);
+});
+```
+
+```csharp
+public sealed class MinioStorageOptions
+{
+    public string Endpoint { get; set; } = string.Empty;
+    public string AccessKey { get; set; } = string.Empty;
+    public string SecretKey { get; set; } = string.Empty;
+    public bool UseSsl { get; set; } = true;
+    public string BucketName { get; set; } = string.Empty;
+    public string ObjectPrefix { get; set; } = string.Empty;
+}
+```
+
+**The scheduler service**
+
+```csharp
+using DRMS.ExcelReporting;
+using Minio;
+using Minio.DataModel.Args;
+
+public class FraudAlertScheduler
+{
+    private const string FastOnboardingReport = "FastOnboardingAlert"; // key in "ExcelReporting:Reports"
+    private const string FastOnboardingSource = "FastOnboarding";      // "DataSource" of the sheet
+
+    private readonly IDeviceRentalProxy _deviceRentalProxy;
+    private readonly IExcelReportGenerator _excelReportGenerator;
+    private readonly IMinioClient _minioClient;
+    private readonly MinioStorageOptions _minioOptions;
+    private readonly FraudSchedulerOptions _fraudSchedulerOptions;
+    private readonly ILogger<FraudAlertScheduler> _logger;
+
+    public FraudAlertScheduler(
+        IDeviceRentalProxy deviceRentalProxy,
+        IExcelReportGenerator excelReportGenerator,
+        IMinioClient minioClient,
+        IOptions<MinioStorageOptions> minioOptions,
+        IOptions<FraudSchedulerOptions> fraudSchedulerOptions,
+        ILogger<FraudAlertScheduler> logger)
+    {
+        _deviceRentalProxy = deviceRentalProxy;
+        _excelReportGenerator = excelReportGenerator;
+        _minioClient = minioClient;
+        _minioOptions = minioOptions.Value;
+        _fraudSchedulerOptions = fraudSchedulerOptions.Value;
+        _logger = logger;
+    }
+
+    public async Task<bool> SendFastOnboardingAlert(CancellationToken cancellationToken = default)
+    {
+        DateTimeOffset timeNow = DateTimeHelper.GetSouthAfricaTimeNowWithOffSet();
+
+        var startDateTime = new DateTimeOffset(timeNow.Date, timeNow.Offset);
+        var endDateTime = startDateTime.AddDays(1).AddTicks(-1);
+
+        var request = new Requests.DeviceRental.GetFastOnboardingRequest
+        {
+            TriggerThresholdInMinutes = _fraudSchedulerOptions.FastOnboarding.TriggerThresholdInMinutes,
+            StartDateTime = startDateTime,
+            EndDateTime = endDateTime,
+        };
+
+        List<FastOnboardingResponse>? response = await _deviceRentalProxy.GetFastOnboardingAsync(request, cancellationToken);
+
+        if (response is null || response.Count == 0)
+        {
+            _logger.LogInformation("No Results were found for SendFastOnboardingAlert! No alert generated !");
+            return false;
+        }
+
+        // One alert id per agreement: 1, 2, 3, ...
+        var alertNumber = 0;
+        foreach (var group in response.GroupBy(x => x.AgreementId))
+        {
+            alertNumber++;
+            foreach (var item in group)
+            {
+                item.AlertId = alertNumber.ToString();
+                item.AlertType = _fraudSchedulerOptions.FastOnboarding.AlertType;
+            }
+        }
+
+        // Sort by the number, not the text ("10" would come before "2" as text).
+        response = response.OrderBy(x => int.Parse(x.AlertId)).ToList();
+
+        // Create the Excel file, upload it, delete the local copy.
+        var objectName = await UploadFastOnboardingReportAsync(response, startDateTime, cancellationToken);
+
+        _logger.LogInformation(
+            "Fast onboarding alert report with {RowCount} row(s) uploaded to '{Bucket}/{ObjectName}'.",
+            response.Count, _minioOptions.BucketName, objectName);
+
+        return true;
+    }
+
+    /// <summary>
+    /// Writes the alerts to an Excel file, uploads it to MinIO and deletes the local file.
+    /// Returns the MinIO object name.
+    /// </summary>
+    private async Task<string> UploadFastOnboardingReportAsync(
+        List<FastOnboardingResponse> alerts,
+        DateTimeOffset reportDate,
+        CancellationToken cancellationToken)
+    {
+        var data = new ExcelReportData().Add(FastOnboardingSource, alerts);
+
+        // 1. Create the file. Folder and file name come from appsettings.json.
+        //    "await using" deletes the local file at the end of this method,
+        //    also when the upload throws an exception.
+        await using var reportFile = _excelReportGenerator.GenerateToFile(FastOnboardingReport, data);
+
+        _logger.LogDebug("Fast onboarding report created at {FilePath} ({Size} bytes).", reportFile.FilePath, reportFile.Length);
+
+        // 2. Object name in the bucket, e.g. "fast-onboarding/2026/11/05/FastOnboardingAlert_20261105_101500_ab12cd34.xlsx".
+        var objectName = $"{_minioOptions.ObjectPrefix}/{reportDate:yyyy/MM/dd}/{reportFile.FileName}";
+
+        // 3. Upload from the file stream.
+        await using (var stream = reportFile.OpenRead())
+        {
+            var putObjectArgs = new PutObjectArgs()
+                .WithBucket(_minioOptions.BucketName)
+                .WithObject(objectName)
+                .WithStreamData(stream)
+                .WithObjectSize(reportFile.Length)
+                .WithContentType(reportFile.ContentType);
+
+            await _minioClient.PutObjectAsync(putObjectArgs, cancellationToken);
+        }
+
+        return objectName;
+    } // 4. reportFile is disposed here -> local file and its empty folder are deleted.
+}
+```
+
+What happens step by step:
+
+| Step | Call | Result |
+|---|---|---|
+| 1 | `GenerateToFile("FastOnboardingAlert", data)` | `/tmp/ExcelReports/FastOnboardingAlert/FastOnboardingAlert_20261105_101500_ab12cd34.xlsx` is created. |
+| 2 | `reportFile.FileName` / `FilePath` / `Length` / `ContentType` | Everything the upload needs. |
+| 3 | `reportFile.OpenRead()` + `PutObjectAsync` | The file is streamed to MinIO; it is not loaded into memory. |
+| 4 | end of `await using` | The local file is deleted, and so is the `FastOnboardingAlert` folder if the library created it and it is now empty. |
+
+### Example 2 – Same upload, without a local file
+
+When you do not need a file on disk, generate into memory. Good for small and medium reports;
+the whole file is held in memory while uploading.
+
+```csharp
+private async Task<string> UploadFastOnboardingReportFromMemoryAsync(
+    List<FastOnboardingResponse> alerts,
+    CancellationToken cancellationToken)
+{
+    var data = new ExcelReportData().Add("FastOnboarding", alerts);
+
+    using var stream = _excelReportGenerator.GenerateToStream("FastOnboardingAlert", data); // already at position 0
+    var objectName = $"{_minioOptions.ObjectPrefix}/{_excelReportGenerator.GetFileName("FastOnboardingAlert")}";
+
+    await _minioClient.PutObjectAsync(new PutObjectArgs()
+        .WithBucket(_minioOptions.BucketName)
+        .WithObject(objectName)
+        .WithStreamData(stream)
+        .WithObjectSize(stream.Length)
+        .WithContentType(ExcelReportGenerator.ContentType), cancellationToken);
+
+    return objectName;
+}
+```
+
+### Example 3 – Keep the local file when the upload fails
+
+By default the file is always deleted. If you would rather keep it for a retry or to look at it,
+switch off the delete when the upload throws:
+
+```csharp
+await using var reportFile = _excelReportGenerator.GenerateToFile("FastOnboardingAlert", data);
+
+try
+{
+    await using var stream = reportFile.OpenRead();
+    await _minioClient.PutObjectAsync(/* ... as in Example 1 ... */, cancellationToken);
+}
+catch (Exception ex)
+{
+    reportFile.DeleteOnDispose = false; // keep it
+    _logger.LogError(ex, "Upload failed. The report was kept at {FilePath}.", reportFile.FilePath);
+    throw;
+}
+```
+
+Kept files are removed later by `DeleteOldReportFiles()` (see Example 5) once they are older than
+`Output:CleanupFilesOlderThan`.
+
+### Example 4 – Choose the folder or file name in code
+
+The two optional arguments override the configured folder and file name for one call only.
+Placeholders work here too.
+
+```csharp
+await using var reportFile = _excelReportGenerator.GenerateToFile(
+    "FastOnboardingAlert",
+    data,
+    outputDirectory: "/var/app/reports/{ReportName}",
+    fileName: $"FastOnboarding_{startDateTime:yyyyMMdd}_{{Guid:8}}");   // {{ }} = a literal { } in C# interpolation
+
+Console.WriteLine(reportFile.FilePath); // /var/app/reports/FastOnboardingAlert/FastOnboarding_20261029_1a2b3c4d.xlsx
+```
+
+### Example 5 – Remove left-over files on a timer
+
+If the process stops between creating and disposing a file, the file stays on disk.
+A small background service removes such files regularly:
+
+```csharp
+public sealed class ReportFileCleanupService(IExcelReportGenerator generator, ILogger<ReportFileCleanupService> logger)
+    : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromHours(1));
+
+        do
+        {
+            try
+            {
+                generator.DeleteOldReportFiles(); // uses Output:CleanupFilesOlderThan
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Cleaning up old report files failed.");
+            }
+        }
+        while (await timer.WaitForNextTickAsync(stoppingToken));
+    }
+}
+
+// Program.cs
+builder.Services.AddHostedService<ReportFileCleanupService>();
+```
+
+### Example 6 – Several sheets in one alert file
+
+Each sheet reads its own list. Here a summary sheet (one row per agreement) is added next to the
+detail sheet. Add a second sheet with `"DataSource": "FastOnboardingSummary"` to the report in
+appsettings.json, then:
+
+```csharp
+var summary = response
+    .GroupBy(x => x.AgreementId)
+    .Select(g => new { AgreementId = g.Key, AlertId = g.First().AlertId, Rows = g.Count() })
+    .ToList();
+
+var data = new ExcelReportData()
+    .Add("FastOnboarding", response)          // detail sheet
+    .Add("FastOnboardingSummary", summary);   // summary sheet (anonymous types work too)
+
+await using var reportFile = _excelReportGenerator.GenerateToFile("FastOnboardingAlert", data);
+```
+
+### Example 7 – Return the report from a Web API
+
+```csharp
+app.MapGet("/reports/fast-onboarding", async (IExcelReportGenerator generator, IDeviceRentalProxy proxy, CancellationToken ct) =>
+{
+    var rows = await proxy.GetFastOnboardingAsync(/* request */, ct);
+    var bytes = generator.Generate("FastOnboardingAlert", new ExcelReportData().Add("FastOnboarding", rows));
+
+    return Results.File(bytes, ExcelReportGenerator.ContentType, generator.GetFileName("FastOnboardingAlert"));
+});
+```
+
+### Example 8 – A report defined in code (no appsettings.json)
+
+Useful for one-off exports or tests.
+
+```csharp
+var report = new ReportDefinition
+{
+    FileName = "AdHoc_{Timestamp}",
+    Sheets =
+    [
+        new SheetDefinition
+        {
+            Name = "Alerts",
+            Columns =
+            [
+                new ColumnDefinition { Header = "Alert Id", Property = "AlertId", DataType = ExcelDataType.Integer },
+                new ColumnDefinition { Header = "Agreement", Property = "AgreementId" },
+            ],
+        },
+    ],
+};
+
+await using var reportFile = generator.GenerateToFile(report, ExcelReportData.ForAllSheets(response));
+```
 
 ## Configuration reference
 
