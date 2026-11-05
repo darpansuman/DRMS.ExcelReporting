@@ -1,8 +1,10 @@
-﻿// Sample: build Excel reports from DTOs using the layout in appsettings.json.
+// Sample: build Excel reports from DTOs using the layout in appsettings.json,
+// save them to disk or to a stream, "upload" them, and clean up the local files.
 //
-// Run:  dotnet run --project samples/DRMS.ExcelReporting.Sample
-// Output files are written to the "output" folder next to the executable
-// (or to the folder passed as the first argument).
+// Run:  dotnet run --project samples/DRMS.ExcelReporting.Sample [folder-for-kept-files]
+//
+// The "upload" here only copies the stream into a local "uploaded" folder. Replace
+// UploadAsync with your storage client (for example MinIO's PutObjectAsync) in your own project.
 
 using DRMS.ExcelReporting;
 using DRMS.ExcelReporting.Sample.Dtos;
@@ -23,39 +25,95 @@ builder.Services.AddExcelReporting(builder.Configuration);
 using var host = builder.Build();
 
 var generator = host.Services.GetRequiredService<IExcelReportGenerator>();
-
 var outputFolder = args.Length > 0 ? args[0] : Path.Combine(AppContext.BaseDirectory, "output");
-Directory.CreateDirectory(outputFolder);
 
-// 2. Get your data (normally from a database or an API).
+// 2. Remove files left behind by earlier runs (for example after a crash).
+//    Deletes *.xlsx files older than "Output:CleanupFilesOlderThan" in the configured folders.
+var removed = generator.DeleteOldReportFiles();
+Console.WriteLine($"Old report files removed: {removed}");
+
+// 3. Get your data (normally from a database or an API).
 var employees = SampleData.Employees();
-var departments = SampleData.Departments();
-
-// 3a. A report with several sheets: give each sheet its own list.
-//     The names match "DataSource" (or the sheet "Name") in appsettings.json.
 var reportData = new ExcelReportData()
     .Add("Employees", employees)
     .Add("ActiveEmployees", employees.Where(e => e.IsActive))
-    .Add("Departments", departments);
+    .Add("Departments", SampleData.Departments());
 
-var employeeReportPath = Path.Combine(outputFolder, generator.GetFileName("EmployeeReport"));
-File.WriteAllBytes(employeeReportPath, generator.Generate("EmployeeReport", reportData));
-Console.WriteLine($"Created {employeeReportPath}");
-
-// 3b. A report where every sheet uses the same list. You can also write straight to a stream.
-var contactsPath = Path.Combine(outputFolder, generator.GetFileName("ContactList"));
-using (var file = File.Create(contactsPath))
+// ---------------------------------------------------------------------------------------
+// Option A: save to a file, upload it, then delete it.
+// The folder and file name come from "Output" / the report's "OutputDirectory" and "FileName".
+// ---------------------------------------------------------------------------------------
+string uploadedFilePath;
+await using (var reportFile = generator.GenerateToFile("EmployeeReport", reportData))
 {
-    generator.Generate("ContactList", ExcelReportData.ForAllSheets(employees), file);
+    Console.WriteLine();
+    Console.WriteLine("Option A - file on disk");
+    Console.WriteLine($"  Path:         {reportFile.FilePath}");
+    Console.WriteLine($"  File name:    {reportFile.FileName}");
+    Console.WriteLine($"  Size:         {reportFile.Length:N0} bytes");
+    Console.WriteLine($"  Content type: {reportFile.ContentType}");
+
+    await using (var stream = reportFile.OpenRead())
+    {
+        await UploadAsync(reportFile.FileName, stream, reportFile.Length, reportFile.ContentType);
+    }
+
+    uploadedFilePath = reportFile.FilePath;
+} // <- the local file (and the folder created for it, if now empty) is deleted here.
+
+Console.WriteLine($"  Local file still exists after dispose: {File.Exists(uploadedFilePath)}");
+
+// ---------------------------------------------------------------------------------------
+// Option B: choose the folder and file name in code, and keep the file.
+// ---------------------------------------------------------------------------------------
+using (var keptFile = generator.GenerateToFile(
+    "ContactList",
+    ExcelReportData.ForAllSheets(employees),
+    outputDirectory: outputFolder,
+    fileName: "Contacts_{Date:yyyy-MM-dd}"))
+{
+    keptFile.DeleteOnDispose = false; // Keep this one so you can open it.
+
+    Console.WriteLine();
+    Console.WriteLine("Option B - file kept");
+    Console.WriteLine($"  Path: {keptFile.FilePath}");
+
+    // You can also delete it yourself at any time: keptFile.Delete();
 }
 
-Console.WriteLine($"Created {contactsPath}");
+// Same, but with the full employee report, so you can open it and look at it.
+using (var keptReport = generator.GenerateToFile("EmployeeReport", reportData, outputDirectory: outputFolder))
+{
+    keptReport.DeleteOnDispose = false;
+    Console.WriteLine($"  Path: {keptReport.FilePath}");
+}
 
-// In an ASP.NET Core API you would return the file like this:
-//   app.MapGet("/reports/employees", (IExcelReportGenerator generator) =>
-//       Results.File(generator.Generate("EmployeeReport", data),
-//                    ExcelReportGenerator.ContentType,
-//                    generator.GetFileName("EmployeeReport")));
+// ---------------------------------------------------------------------------------------
+// Option C: no file at all - generate into memory and upload the stream.
+// ---------------------------------------------------------------------------------------
+using (var memoryStream = generator.GenerateToStream("EmployeeReport", reportData))
+{
+    var objectName = generator.GetFileName("EmployeeReport");
+
+    Console.WriteLine();
+    Console.WriteLine("Option C - memory stream");
+    Console.WriteLine($"  Object name: {objectName}, size: {memoryStream.Length:N0} bytes");
+
+    await UploadAsync(objectName, memoryStream, memoryStream.Length, ExcelReportGenerator.ContentType);
+}
+
+// Stand-in for a real storage upload. Put your MinIO (or other storage) call here.
+// A typical storage API needs exactly these four values: object name, stream, size and content type.
+async Task UploadAsync(string objectName, Stream content, long size, string contentType)
+{
+    var uploadFolder = Path.Combine(outputFolder, "uploaded");
+    Directory.CreateDirectory(uploadFolder);
+
+    await using var target = File.Create(Path.Combine(uploadFolder, objectName));
+    await content.CopyToAsync(target);
+
+    Console.WriteLine($"  Uploaded '{objectName}' ({size:N0} bytes, {contentType}) to {uploadFolder}");
+}
 
 /// <summary>Creates sample data for the demo.</summary>
 internal static class SampleData

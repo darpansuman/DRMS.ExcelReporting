@@ -22,6 +22,10 @@ namespace DRMS.ExcelReporting;
 /// 5. Apply column widths, alignment, frozen header and filter.
 /// 6. When a sheet has more rows than allowed, continue on a new sheet named "Name (2)", "Name (3)", ...
 ///
+/// The result can be returned as bytes, written to any stream, returned as a <see cref="MemoryStream"/>,
+/// or saved as a file on disk (<see cref="GenerateToFile(string, ExcelReportData, string?, string?)"/>),
+/// for example to upload it to object storage and delete it afterwards.
+///
 /// This class is thread-safe and can be registered as a singleton.
 /// </remarks>
 public sealed class ExcelReportGenerator : IExcelReportGenerator
@@ -38,30 +42,51 @@ public sealed class ExcelReportGenerator : IExcelReportGenerator
     /// <summary>Extra width added to auto-fitted columns, in Excel character units.</summary>
     private const double AutoFitPadding = 3;
 
+    /// <summary>Extension of the temporary file used while the workbook is being written.</summary>
+    private const string TempFileExtension = ".xlsx.tmp";
+
+    /// <summary>"{ReportName}" value used for reports built in code.</summary>
+    private const string CodeReportName = "Report";
+
     private readonly Func<ExcelReportingOptions> _getOptions;
     private readonly ILogger _logger;
+    private readonly TimeProvider _timeProvider;
 
     /// <summary>
     /// Constructor used by dependency injection. Reads the latest configuration on every call,
     /// so changes to appsettings.json are picked up without restarting the application.
     /// </summary>
-    public ExcelReportGenerator(IOptionsMonitor<ExcelReportingOptions> options, ILogger<ExcelReportGenerator>? logger = null)
+    /// <param name="options">The "ExcelReporting" settings.</param>
+    /// <param name="logger">Optional logger.</param>
+    /// <param name="timeProvider">Optional clock used for {Date}/{Time}/{Timestamp} in file names. Default: system clock.</param>
+    public ExcelReportGenerator(
+        IOptionsMonitor<ExcelReportingOptions> options,
+        ILogger<ExcelReportGenerator>? logger = null,
+        TimeProvider? timeProvider = null)
     {
         ArgumentNullException.ThrowIfNull(options);
 
         _getOptions = () => options.CurrentValue;
         _logger = logger ?? NullLogger<ExcelReportGenerator>.Instance;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     /// <summary>
     /// Constructor for use without dependency injection, for example in a console tool or a test.
     /// </summary>
-    public ExcelReportGenerator(ExcelReportingOptions options, ILogger<ExcelReportGenerator>? logger = null)
+    /// <param name="options">The "ExcelReporting" settings.</param>
+    /// <param name="logger">Optional logger.</param>
+    /// <param name="timeProvider">Optional clock used for {Date}/{Time}/{Timestamp} in file names. Default: system clock.</param>
+    public ExcelReportGenerator(
+        ExcelReportingOptions options,
+        ILogger<ExcelReportGenerator>? logger = null,
+        TimeProvider? timeProvider = null)
     {
         ArgumentNullException.ThrowIfNull(options);
 
         _getOptions = () => options;
         _logger = logger ?? NullLogger<ExcelReportGenerator>.Instance;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     /// <inheritdoc />
@@ -95,24 +120,279 @@ public sealed class ExcelReportGenerator : IExcelReportGenerator
     /// <inheritdoc />
     public void Generate(ReportDefinition report, ExcelReportData data, Stream output)
     {
-        ArgumentNullException.ThrowIfNull(report);
+        EnsureValid(report);
+        WriteReport(CodeReportName, report, _getOptions().Defaults, data, output);
+    }
 
-        var errors = ExcelReportingOptionsValidator.ValidateReport("(code)", report);
-        if (errors.Count > 0)
+    /// <inheritdoc />
+    public MemoryStream GenerateToStream(string reportName, ExcelReportData data)
+    {
+        var stream = new MemoryStream();
+        try
         {
-            throw new InvalidOperationException("The report definition is not valid:" + Environment.NewLine + string.Join(Environment.NewLine, errors));
+            Generate(reportName, data, stream);
+            stream.Position = 0;
+            return stream;
         }
+        catch
+        {
+            stream.Dispose();
+            throw;
+        }
+    }
 
-        WriteReport("(code)", report, _getOptions().Defaults, data, output);
+    /// <inheritdoc />
+    public ExcelReportFile GenerateToFile(string reportName, ExcelReportData data, string? outputDirectory = null, string? fileName = null)
+    {
+        var options = _getOptions();
+        var report = FindReport(options, reportName);
+        return WriteReportFile(reportName, report, options.Defaults, data, outputDirectory, fileName);
+    }
+
+    /// <inheritdoc />
+    public ExcelReportFile GenerateToFile(ReportDefinition report, ExcelReportData data, string? outputDirectory = null, string? fileName = null)
+    {
+        EnsureValid(report);
+        return WriteReportFile(CodeReportName, report, _getOptions().Defaults, data, outputDirectory, fileName);
     }
 
     /// <inheritdoc />
     public string GetFileName(string reportName)
     {
-        var report = FindReport(_getOptions(), reportName);
-        var fileName = string.IsNullOrWhiteSpace(report.FileName) ? reportName : report.FileName;
+        var options = _getOptions();
+        var report = FindReport(options, reportName);
 
-        return fileName.EndsWith(".xlsx", StringComparison.OrdinalIgnoreCase) ? fileName : fileName + ".xlsx";
+        return OutputPathBuilder.BuildFileName(GetFileNamePattern(report, options.Defaults.Output), reportName, _timeProvider.GetLocalNow());
+    }
+
+    /// <inheritdoc />
+    public string GetOutputDirectory(string reportName)
+    {
+        var options = _getOptions();
+        var report = FindReport(options, reportName);
+
+        return OutputPathBuilder.BuildDirectory(GetDirectoryPattern(report, options.Defaults.Output), reportName);
+    }
+
+    /// <inheritdoc />
+    public int DeleteOldReportFiles(TimeSpan? olderThan = null)
+    {
+        var options = _getOptions();
+        var output = options.Defaults.Output;
+        var cutoffUtc = _timeProvider.GetUtcNow().UtcDateTime - (olderThan ?? output.CleanupFilesOlderThan);
+
+        // Every folder a report can be saved in: the default folder and each report's own folder.
+        var directories = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var (name, report) in options.Reports)
+        {
+            directories.Add(OutputPathBuilder.BuildDirectory(GetDirectoryPattern(report, output), name));
+        }
+
+        if (!output.Directory.Contains("{ReportName}", StringComparison.OrdinalIgnoreCase))
+        {
+            directories.Add(OutputPathBuilder.BuildDirectory(output.Directory, CodeReportName));
+        }
+
+        var deleted = 0;
+        foreach (var directory in directories)
+        {
+            deleted += DeleteOldFilesIn(directory, cutoffUtc);
+        }
+
+        if (deleted > 0)
+        {
+            _logger.LogInformation("Deleted {Count} old report file(s).", deleted);
+        }
+
+        return deleted;
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // Saving to disk
+    // ----------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Saves the report to disk. The workbook is first written to a hidden temporary file and then
+    /// renamed, so nobody ever sees (or uploads) a half-written file.
+    /// </summary>
+    private ExcelReportFile WriteReportFile(
+        string reportName,
+        ReportDefinition report,
+        ReportDefaults defaults,
+        ExcelReportData data,
+        string? directoryOverride,
+        string? fileNameOverride)
+    {
+        var output = defaults.Output;
+        var now = _timeProvider.GetLocalNow();
+
+        var directory = OutputPathBuilder.BuildDirectory(
+            string.IsNullOrWhiteSpace(directoryOverride) ? GetDirectoryPattern(report, output) : directoryOverride,
+            reportName);
+
+        var fileName = OutputPathBuilder.BuildFileName(
+            string.IsNullOrWhiteSpace(fileNameOverride) ? GetFileNamePattern(report, output) : fileNameOverride,
+            reportName,
+            now);
+
+        var createdDirectories = CreateDirectory(directory);
+        var tempPath = Path.Combine(directory, $".{Guid.NewGuid():N}{TempFileExtension}");
+
+        try
+        {
+            using (var stream = CreateTempFile(tempPath))
+            {
+                WriteReport(reportName, report, defaults, data, stream);
+            }
+
+            var finalPath = MoveToFinalName(tempPath, directory, fileName, output.OverwriteExisting);
+
+            _logger.LogInformation("Excel report '{ReportName}' saved to '{FilePath}'.", reportName, finalPath);
+
+            return new ExcelReportFile(
+                reportName,
+                finalPath,
+                now,
+                createdDirectories,
+                output.DeleteFileOnDispose,
+                output.DeleteEmptyDirectories,
+                _logger);
+        }
+        catch
+        {
+            // Leave nothing behind when the report could not be created.
+            TryDeleteFile(tempPath);
+            if (output.DeleteEmptyDirectories)
+            {
+                ExcelReportFile.DeleteEmptyCreatedDirectories(createdDirectories, _logger);
+            }
+
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Creates the folder and returns the folders that did not exist before, deepest first,
+    /// so they can be removed again when the file is deleted.
+    /// </summary>
+    private static List<string> CreateDirectory(string directory)
+    {
+        var missing = new List<string>();
+        for (var current = directory; current is not null && !Directory.Exists(current); current = Path.GetDirectoryName(current))
+        {
+            missing.Add(current);
+        }
+
+        Directory.CreateDirectory(directory);
+        return missing;
+    }
+
+    private static FileStream CreateTempFile(string tempPath)
+    {
+        try
+        {
+            return new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+        }
+        catch (DirectoryNotFoundException)
+        {
+            // Another report may have just removed this (empty) folder during its cleanup. Create it again.
+            Directory.CreateDirectory(Path.GetDirectoryName(tempPath)!);
+            return new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+        }
+    }
+
+    /// <summary>
+    /// Renames the temporary file to its final name. When the name is taken and overwriting is off,
+    /// tries "Name_1.xlsx", "Name_2.xlsx", ... until a free name is found.
+    /// </summary>
+    private static string MoveToFinalName(string tempPath, string directory, string fileName, bool overwrite)
+    {
+        var target = Path.Combine(directory, fileName);
+
+        if (overwrite)
+        {
+            File.Move(tempPath, target, overwrite: true);
+            return target;
+        }
+
+        var stem = Path.GetFileNameWithoutExtension(fileName);
+        var extension = Path.GetExtension(fileName);
+
+        for (var attempt = 1; attempt <= 10_000; attempt++)
+        {
+            try
+            {
+                File.Move(tempPath, target, overwrite: false);
+                return target;
+            }
+            catch (IOException) when (File.Exists(target))
+            {
+                target = Path.Combine(directory, $"{stem}_{attempt}{extension}");
+            }
+        }
+
+        throw new IOException($"Could not find a free file name for '{fileName}' in '{directory}'.");
+    }
+
+    private int DeleteOldFilesIn(string directory, DateTime cutoffUtc)
+    {
+        // Safety net: never clean the root of a drive.
+        if (!Directory.Exists(directory) || string.Equals(Path.GetPathRoot(directory), directory, StringComparison.OrdinalIgnoreCase))
+        {
+            return 0;
+        }
+
+        var deleted = 0;
+        var candidates = Directory.EnumerateFiles(directory, "*.xlsx")
+            .Concat(Directory.EnumerateFiles(directory, "*" + TempFileExtension));
+
+        foreach (var file in candidates)
+        {
+            try
+            {
+                if (File.GetLastWriteTimeUtc(file) < cutoffUtc)
+                {
+                    File.Delete(file);
+                    deleted++;
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // The file may be open (for example still being uploaded). It is tried again next time.
+                _logger.LogDebug(ex, "Old report file '{File}' was not deleted.", file);
+            }
+        }
+
+        return deleted;
+    }
+
+    private void TryDeleteFile(string path)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogWarning(ex, "Could not delete temporary file '{FilePath}'.", path);
+        }
+    }
+
+    private static string GetFileNamePattern(ReportDefinition report, OutputOptions output) =>
+        string.IsNullOrWhiteSpace(report.FileName) ? output.FileName : report.FileName;
+
+    private static string GetDirectoryPattern(ReportDefinition report, OutputOptions output) =>
+        string.IsNullOrWhiteSpace(report.OutputDirectory) ? output.Directory : report.OutputDirectory;
+
+    private static void EnsureValid(ReportDefinition report)
+    {
+        ArgumentNullException.ThrowIfNull(report);
+
+        var errors = ExcelReportingOptionsValidator.ValidateReport(CodeReportName, report);
+        if (errors.Count > 0)
+        {
+            throw new InvalidOperationException("The report definition is not valid:" + Environment.NewLine + string.Join(Environment.NewLine, errors));
+        }
     }
 
     // ----------------------------------------------------------------------------------------

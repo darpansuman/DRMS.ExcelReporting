@@ -1,3 +1,4 @@
+using DRMS.ExcelReporting.Internal;
 using Microsoft.Extensions.Options;
 
 namespace DRMS.ExcelReporting.Configuration;
@@ -25,6 +26,21 @@ public sealed class ExcelReportingOptionsValidator : IValidateOptions<ExcelRepor
             errors.Add("Defaults.MaxRowsPerSheet must be between 1 and 1048575.");
         }
 
+        var output = options.Defaults.Output;
+
+        if (string.IsNullOrWhiteSpace(output.Directory))
+        {
+            errors.Add("Defaults.Output.Directory is required.");
+        }
+
+        if (output.CleanupFilesOlderThan <= TimeSpan.Zero)
+        {
+            errors.Add("Defaults.Output.CleanupFilesOlderThan must be greater than zero.");
+        }
+
+        errors.AddRange(ValidatePattern("Defaults.Output.Directory", output.Directory, OutputPathBuilder.DirectoryTokens));
+        errors.AddRange(ValidatePattern("Defaults.Output.FileName", output.FileName, OutputPathBuilder.FileNameTokens));
+
         foreach (var (reportName, report) in options.Reports)
         {
             errors.AddRange(ValidateReport(reportName, report));
@@ -45,6 +61,9 @@ public sealed class ExcelReportingOptionsValidator : IValidateOptions<ExcelRepor
         {
             errors.Add($"{prefix} must have at least one sheet.");
         }
+
+        errors.AddRange(ValidatePattern($"{prefix}: FileName", report.FileName, OutputPathBuilder.FileNameTokens));
+        errors.AddRange(ValidatePattern($"{prefix}: OutputDirectory", report.OutputDirectory, OutputPathBuilder.DirectoryTokens));
 
         var seenSheetNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -104,4 +123,8 @@ public sealed class ExcelReportingOptionsValidator : IValidateOptions<ExcelRepor
 
         return errors;
     }
+
+    private static IEnumerable<string> ValidatePattern(string setting, string pattern, string[] allowedTokens) =>
+        OutputPathBuilder.FindUnknownTokens(pattern ?? string.Empty, allowedTokens)
+            .Select(token => $"{setting}: unknown placeholder '{{{token}}}'. Allowed: {string.Join(", ", allowedTokens.Select(t => "{" + t + "}"))}.");
 }

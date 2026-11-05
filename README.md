@@ -9,6 +9,7 @@ The whole layout of each report lives in `appsettings.json`:
 - value mappings (for example `true` → `Yes`, `A` → `Active`)
 - sheet names, and which list fills each sheet
 - line break rules inside cells
+- where the file is saved (folder and file name pattern) and when it is deleted again
 
 Change a report by editing configuration — no code change, no rebuild.
 
@@ -21,6 +22,7 @@ src/DRMS.ExcelReporting/                  The reusable library (copy this folder
   ExcelReportGenerator.cs                 Main class: builds the workbook
   IExcelReportGenerator.cs                Interface (easy to mock in tests)
   ExcelReportData.cs                      Holds one list of DTOs per sheet
+  ExcelReportFile.cs                      A saved report file: path, size, read stream, auto-delete
   Configuration/
     ExcelReportingOptions.cs              Classes that mirror the appsettings.json section
     ExcelDataType.cs                      Supported Excel data types
@@ -29,6 +31,7 @@ src/DRMS.ExcelReporting/                  The reusable library (copy this folder
     PropertyValueResolver.cs              Reads "Address.City" style paths from a DTO (cached, fast)
     CellValueConverter.cs                 Value mappings, defaults, data type conversion
     LineBreakHelper.cs                    Turns separators and \r\n into Excel new lines
+    OutputPathBuilder.cs                  Fills in {ReportName}/{Timestamp}/... and makes file names safe
   DependencyInjection/
     ServiceCollectionExtensions.cs        services.AddExcelReporting(configuration)
 samples/DRMS.ExcelReporting.Sample/       Console demo with appsettings.json and sample DTOs
@@ -43,7 +46,8 @@ Run the sample:
 dotnet run --project samples/DRMS.ExcelReporting.Sample
 ```
 
-It writes `EmployeeReport.xlsx` (3 sheets) and `Contacts.xlsx` into `samples/DRMS.ExcelReporting.Sample/bin/Debug/net10.0/output/`.
+It shows the three ways to get a report out (file + delete after upload, file kept, memory stream) and
+keeps a couple of files in `samples/DRMS.ExcelReporting.Sample/bin/Debug/net10.0/output/` so you can open them.
 
 Run the tests:
 
@@ -92,6 +96,70 @@ byte[] file = generator.Generate("EmployeeReport", employees);
 
 You can also build a `ReportDefinition` in code and pass it to `Generate(report, data)`.
 
+## Saving to disk, uploading and cleaning up
+
+The generator can hand the report over in three ways. Pick the one your storage client (MinIO, S3,
+Azure Blob, a network share, …) needs. This library does not upload anything itself.
+
+| Method | Returns | Use when |
+|---|---|---|
+| `GenerateToFile(reportName, data, outputDirectory?, fileName?)` | `ExcelReportFile` | You need a real file path, or want the file on disk while uploading. |
+| `GenerateToStream(reportName, data)` | `MemoryStream` at position 0 | You want to upload straight from memory, without touching the disk. |
+| `Generate(reportName, data, stream)` | — | You already have a target stream (HTTP response, file, …). |
+
+### `ExcelReportFile`
+
+| Member | Meaning |
+|---|---|
+| `FilePath` | Full path of the saved file. |
+| `FileName` | File name only, e.g. `EmployeeReport_20261105_101500.xlsx` — handy as the object name. |
+| `DirectoryPath` | Folder that holds the file. |
+| `Length` | Size in bytes (most upload APIs ask for it). |
+| `ContentType` | `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` |
+| `OpenRead()` | Opens a read stream for the upload. The file can still be deleted while it is open. |
+| `Delete()` | Deletes the file now (safe to call more than once). |
+| `DeleteOnDispose` | When `true` (default from config), disposing the object deletes the file. Set `false` to keep it. |
+| `Dispose()` / `DisposeAsync()` | Deletes the file (if `DeleteOnDispose`) and the folders created for it, if now empty. |
+
+Typical use — the local file is always removed, even if the upload throws:
+
+```csharp
+await using var report = generator.GenerateToFile("EmployeeReport", data);
+
+await using (var stream = report.OpenRead())
+{
+    // Your storage call goes here, for example:
+    // await storage.UploadAsync(bucket, report.FileName, stream, report.Length, report.ContentType);
+}
+// report is disposed here -> local file deleted.
+```
+
+Without a file:
+
+```csharp
+using var stream = generator.GenerateToStream("EmployeeReport", data);
+var objectName = generator.GetFileName("EmployeeReport");
+// await storage.UploadAsync(bucket, objectName, stream, stream.Length, ExcelReportGenerator.ContentType);
+```
+
+### Cleaning up left-over files
+
+If the application stops before a file is disposed, the file stays on disk. Call
+`generator.DeleteOldReportFiles()` at start-up or on a timer: it deletes `*.xlsx` (and unfinished
+`*.xlsx.tmp`) files older than `Output:CleanupFilesOlderThan` from every configured output folder.
+Sub-folders and other file types are never touched — still, **use a folder that only holds reports**.
+
+### How a file is written
+
+1. The folder is created if needed (the library remembers which folders it created).
+2. The workbook is written to a hidden temporary file `.<id>.xlsx.tmp` in that folder.
+3. The temporary file is renamed to the final name, so nobody sees a half-written file.
+   If the name is taken: `OverwriteExisting: true` replaces it, otherwise the file becomes `Name_1.xlsx`, `Name_2.xlsx`, …
+4. If anything fails, the temporary file and any folder created for it are removed.
+
+File names given in config or in code are cleaned: characters that are not allowed in file names
+(including `/` and `\`) become `_`, so a name can never point outside the output folder.
+
 ## Configuration reference
 
 A minimal report:
@@ -130,13 +198,32 @@ See [`samples/DRMS.ExcelReporting.Sample/appsettings.json`](samples/DRMS.ExcelRe
 | `AutoFitColumns` / `MaxColumnWidth` | `true`, `60` | Fit columns to content (first 1,000 rows are measured), with an upper limit. |
 | `FreezeHeaderRow` / `AutoFilter` | `true`, `true` | Freeze the header and add filter drop-downs. |
 | `MaxRowsPerSheet` | `1048575` | More rows continue on extra sheets: `Name (2)`, `Name (3)`, … |
+| `Output.Directory` | `{TempPath}/ExcelReports` | Folder for `GenerateToFile`. Relative paths are relative to the app folder; `%VARS%` are expanded. |
+| `Output.FileName` | `{ReportName}_{Timestamp}` | File name when a report has no `FileName`. `.xlsx` is added when missing. |
+| `Output.OverwriteExisting` | `false` | `false`: an existing name becomes `Name_1.xlsx`, `Name_2.xlsx`, … |
+| `Output.DeleteFileOnDispose` | `true` | Delete the file when the `ExcelReportFile` is disposed. |
+| `Output.DeleteEmptyDirectories` | `true` | Also delete folders that were created for the file, once they are empty. Folders that already existed are never deleted. |
+| `Output.CleanupFilesOlderThan` | `1.00:00:00` | Age used by `DeleteOldReportFiles()` (`d.hh:mm:ss`). |
+
+#### Path placeholders
+
+| Placeholder | Where | Value |
+|---|---|---|
+| `{ReportName}` | folder, file name | The report key, e.g. `EmployeeReport`. |
+| `{TempPath}` | folder | The system temp folder. |
+| `{BaseDirectory}` | folder | The application folder. |
+| `{Date}` / `{Time}` / `{Timestamp}` | file name | Local time: `yyyyMMdd` / `HHmmss` / `yyyyMMdd_HHmmss`. Custom: `{Date:yyyy-MM-dd}`. |
+| `{Guid}` | file name | A new unique id (32 characters). `{Guid:8}` keeps the first 8. |
+
+Unknown placeholders are reported at start-up.
 
 ### Report
 
 | Setting | Meaning |
 |---|---|
 | key (e.g. `"EmployeeReport"`) | The name you pass to `Generate(...)`. Upper/lower case is ignored. |
-| `FileName` | Returned by `GetFileName(...)`. `.xlsx` is added if missing. |
+| `FileName` | File name pattern for this report, e.g. `EmployeeReport_{Timestamp}.xlsx`. Empty = `Output.FileName`. Also returned by `GetFileName(...)`. |
+| `OutputDirectory` | Folder for this report's files. Empty = `Output.Directory`. |
 | `Sheets` | The sheets, in order. |
 
 ### Sheet

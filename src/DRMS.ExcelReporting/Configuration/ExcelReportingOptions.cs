@@ -42,6 +42,9 @@ public sealed class ReportDefaults
     /// <summary>Default line break rules. A column can override them.</summary>
     public LineBreakOptions LineBreaks { get; set; } = new();
 
+    /// <summary>Where report files are saved on disk and how they are cleaned up.</summary>
+    public OutputOptions Output { get; set; } = new();
+
     /// <summary>
     /// When true, column widths are fitted to their content (up to <see cref="MaxColumnWidth"/>).
     /// A column with a fixed "Width" is never auto-fitted.
@@ -63,6 +66,61 @@ public sealed class ReportDefaults
     /// Excel allows 1,048,576 rows including the header.
     /// </summary>
     public int MaxRowsPerSheet { get; set; } = 1_048_575;
+}
+
+/// <summary>
+/// Where generated files are saved and when they are deleted.
+/// Used by <see cref="IExcelReportGenerator.GenerateToFile(string, ExcelReportData, string?, string?)"/>.
+/// </summary>
+/// <remarks>
+/// Directory and file name can contain placeholders that are filled in when the file is created:
+/// <list type="bullet">
+/// <item><c>{ReportName}</c> – the report key, for example "EmployeeReport" (directory and file name).</item>
+/// <item><c>{TempPath}</c> – the system temp folder (directory only).</item>
+/// <item><c>{BaseDirectory}</c> – the application folder (directory only).</item>
+/// <item><c>{Date}</c>, <c>{Time}</c>, <c>{Timestamp}</c> – current local time (file name only).
+/// Defaults: yyyyMMdd, HHmmss, yyyyMMdd_HHmmss. Custom format: <c>{Date:yyyy-MM-dd}</c>.</item>
+/// <item><c>{Guid}</c> – a new unique id (file name only). <c>{Guid:8}</c> keeps only the first 8 characters.</item>
+/// </list>
+/// </remarks>
+public sealed class OutputOptions
+{
+    /// <summary>
+    /// Folder where report files are saved. A relative path is relative to the application folder.
+    /// Environment variables such as %TEMP% are expanded.
+    /// Use a folder that only holds reports, because old-file cleanup deletes *.xlsx files in it.
+    /// </summary>
+    public string Directory { get; set; } = "{TempPath}/ExcelReports";
+
+    /// <summary>
+    /// File name used when a report has no "FileName" of its own. ".xlsx" is added when missing.
+    /// </summary>
+    public string FileName { get; set; } = "{ReportName}_{Timestamp}";
+
+    /// <summary>
+    /// When a file with the same name already exists: true replaces it,
+    /// false keeps it and saves the new file as "Name_1.xlsx", "Name_2.xlsx", ...
+    /// </summary>
+    public bool OverwriteExisting { get; set; }
+
+    /// <summary>
+    /// Delete the file when the <see cref="ExcelReportFile"/> is disposed (for example at the end of a
+    /// "using" block, after uploading it). Can also be changed per file with <see cref="ExcelReportFile.DeleteOnDispose"/>.
+    /// </summary>
+    public bool DeleteFileOnDispose { get; set; } = true;
+
+    /// <summary>
+    /// When a file is deleted, also delete the folders that were created for it, if they are now empty.
+    /// Folders that already existed are never deleted.
+    /// </summary>
+    public bool DeleteEmptyDirectories { get; set; } = true;
+
+    /// <summary>
+    /// Default age used by <see cref="IExcelReportGenerator.DeleteOldReportFiles(TimeSpan?)"/>.
+    /// Files older than this are treated as left-overs (for example after a crash) and deleted.
+    /// Format: "d.hh:mm:ss", for example "1.00:00:00" for one day.
+    /// </summary>
+    public TimeSpan CleanupFilesOlderThan { get; set; } = TimeSpan.FromDays(1);
 }
 
 /// <summary>
@@ -140,8 +198,16 @@ public sealed class LineBreakOptions
 /// </summary>
 public sealed class ReportDefinition
 {
-    /// <summary>Suggested file name, for example "EmployeeReport.xlsx". Used by the Save helpers.</summary>
+    /// <summary>
+    /// File name for this report, for example "EmployeeReport_{Timestamp}.xlsx". Placeholders are allowed
+    /// (see <see cref="OutputOptions"/>). When empty, <see cref="OutputOptions.FileName"/> is used.
+    /// </summary>
     public string FileName { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Folder for this report's files. When empty, <see cref="OutputOptions.Directory"/> is used.
+    /// </summary>
+    public string OutputDirectory { get; set; } = string.Empty;
 
     /// <summary>The sheets in the file, in the order they appear in Excel.</summary>
     public List<SheetDefinition> Sheets { get; set; } = [];
